@@ -28,7 +28,7 @@ class VideoAnnotatorGUI:
         # Welcome message
         ttk.Label(
             self.main_frame,
-            text="Welcome to Video Annotator",
+            text="Welcome to the FLESH Video Annotator \n 1. Click on 'Continue Previous Work' or 'Start Fresh Annotation' \n 2. select your annotation .csv files \n 3. select the video folder.",
             font=('Helvetica', 16)
         ).grid(row=0, column=0, columnspan=2, pady=20)
         
