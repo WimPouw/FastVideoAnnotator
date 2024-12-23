@@ -6,19 +6,18 @@ A simple GUI tool for annotating video files.
 
 1. Have anaconda installed
 
-2. navigate in terminal (or anaconda prompt) to your folder where the files your repo is and create the conda environment, NOTE THIS CAN TAKE LOOONG: (WINDOWS: open conda prompt with administrator rights)
+2. Installation of packages. Navigate in terminal (or anaconda prompt) to your folder where the files your repo is and create the conda environment
    ```bash
    cd c:xxx/xxx/FastVideoAnnotator
-   conda env create -n video-annotator --file environment.yml
-   ```
-
-3. Activate the environment:
-   ```bash
+   conda create -n video-annotator python==3.9
    conda activate video-annotator
+   pip install -r requirements.txt
    ```
 
-4. Run the application:
+4. Run the application (open anaconda prompt):
    ```bash
+   cd c:xxx/xxx/FastVideoAnnotator
+   conda activate video-annotator
    python gui.py
    ```
 
