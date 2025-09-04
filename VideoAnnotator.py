@@ -1,6 +1,7 @@
 import cv2
 import pandas as pd
 import os
+import sys
 from datetime import datetime
 import pygame
 import tempfile
@@ -22,7 +23,7 @@ class VideoAnnotator:
         # Initialize audio with specific settings
         try:
             pygame.mixer.quit()  # Clean up any existing mixer
-            pygame.mixer.init(frequency=44100, size=-16, channels=2, buffer=4096)
+            pygame.mixer.init(frequency=48000, size=-16, channels=1, buffer=4096)
             pygame.mixer.set_num_channels(8)
         except Exception as e:
             print(f"Warning: Could not initialize audio: {str(e)}")
@@ -130,7 +131,7 @@ class VideoAnnotator:
             # Try to clean up mixer entirely if needed
             try:
                 pygame.mixer.quit()
-                pygame.mixer.init(frequency=44100, size=-16, channels=2, buffer=4096)
+                pygame.mixer.init(frequency=48000, size=-16, channels=1, buffer=4096)
             except:
                 pass
 
@@ -142,214 +143,195 @@ class VideoAnnotator:
             print(f"Error opening video: {video_file}")
             return True
 
-        # Get video properties
         fps = cap.get(cv2.CAP_PROP_FPS)
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         duration = total_frames / fps
-        frame_time = 1/fps
-        
-        print(f"\nProcessing: {video_file}")
+
         print(f"Duration: {duration:.1f} seconds")
-        
-        # Load existing annotation if it exists
+
         existing_annotation = self.df[self.df['FILE'] == video_file]
         if not existing_annotation.empty:
             self.current_row = existing_annotation.iloc[0].to_dict()
             print("Loaded existing annotation for review")
-        
-        # Extract and load audio
+
+                # Ensure toggle-able fields are integers
+            for key in ['RECUT_BEGIN', 'RECUT_END', 'MOD_GESTURE', 'MOD_VOCAL', 'LANGUAGE', 'WATCHED']:
+                if key in self.current_row:
+                    try:
+                        self.current_row[key] = int(self.current_row[key])
+                    except:
+                        self.current_row[key] = 0
+
+
         audio_path = self.extract_audio(video_path)
         has_audio = False
         if audio_path and os.path.exists(audio_path):
             try:
-                # Stop any currently playing audio
                 pygame.mixer.music.stop()
                 pygame.mixer.music.unload()
-                
-                # Load and verify the audio file
                 pygame.mixer.music.load(audio_path)
-                
-                # Set initial volume
                 pygame.mixer.music.set_volume(0.5)
-                
-                # Try to play audio
                 pygame.mixer.music.play()
-                
-                # Verify audio is actually playing
-                if pygame.mixer.music.get_busy():
-                    has_audio = True
-                    print("Audio loaded successfully")
-                else:
-                    print("Warning: Audio loaded but not playing")
-                    
+                has_audio = True
+                print("Audio loaded and started")
             except Exception as e:
                 print(f"Warning: Could not play audio: {str(e)}")
-                print("Continuing without audio...")
-                # Clean up pygame mixer in case of error
-                try:
-                    pygame.mixer.music.unload()
-                except:
-                    pass
-        
+
         frame_count = 0
-        last_frame_time = time.time()
+
+        # Ensure OpenCV window is created for this video
+        cv2.namedWindow('Video', cv2.WINDOW_AUTOSIZE)
         
+        # Read the first frame to initialize the frame variable
+        ret, frame = cap.read()
+        if not ret:
+            print(f"Error: Could not read first frame from {video_file}")
+            cap.release()
+            return True
+        
+        # Reset to beginning for normal playback and start unpaused
+        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+        self.paused = False
+
         while True:
-            current_time = time.time()
-            
             if not self.paused:
-                # Only read a new frame if enough time has passed
-                if current_time - last_frame_time >= frame_time:
-                    ret, frame = cap.read()
-                    if not ret:
-                        # Reset video and audio
-                        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                        if has_audio:
-                            pygame.mixer.music.play()
-                        frame_count = 0
-                        ret, frame = cap.read()
-                    
-                    if ret:
-                        # Add command hints to frame
-                        font = cv2.FONT_HERSHEY_SIMPLEX
-                        font_scale = 0.4
-                        thickness = 1
-                        spacing = 15  # Vertical spacing between lines
-                        
-                        commands = [
-                            "SPACE: Play/Pause",
-                            "R: Replay",
-                            "B: Recut begin",
-                            "E: Recut end",
-                            "G: Gesture",
-                            "V: Vocal",
-                            "L: Language",
-                            "C: Add comment",
-                            "Q: Next + Mark watched",
-                            "ESC: Exit",
-                            "↑/↓: Volume"
-                        ]
-                        
-                        # Draw semi-transparent background for better text visibility
-                        overlay = frame.copy()
-                        h, w = frame.shape[:2]
-                        cv2.rectangle(overlay, (0, 0), (150, len(commands) * spacing + 10), (0, 0, 0), -1)
-                        cv2.addWeighted(overlay, 0.3, frame, 0.7, 0, frame)
-                        
-                        # Draw commands
-                        for i, cmd in enumerate(commands):
-                            y = (i + 1) * spacing
-                            cv2.putText(frame, cmd, (5, y), font, font_scale, (255, 255, 255), thickness)
-                        
-                        # Add current state indicators in top right
-                        states = [
-                            f"B:{self.current_row.get('RECUT_BEGIN', 0)}",
-                            f"E:{self.current_row.get('RECUT_END', 0)}",
-                            f"G:{self.current_row.get('MOD_GESTURE', 0)}",
-                            f"V:{self.current_row.get('MOD_VOCAL', 0)}",
-                            f"L:{self.current_row.get('LANGUAGE', 0)}",
-                            f"W:{self.current_row.get('WATCHED', 0)}"
-                        ]
-                        
-                        # Draw states background
-                        cv2.rectangle(frame, (w-100, 0), (w, len(states) * spacing + 10), (0, 0, 0), -1)
-                        
-                        # Draw states
-                        for i, state in enumerate(states):
-                            y = (i + 1) * spacing
-                            cv2.putText(frame, state, (w-95, y), font, font_scale, (255, 255, 255), thickness)
-                        
-                        # Add filename at bottom (without path)
-                        filename_text = os.path.basename(video_file)
-                        text_size = cv2.getTextSize(filename_text, font, font_scale, thickness)[0]
-                        x = (w - text_size[0]) // 2  # Center horizontally
-                        y = h - 20  # 20 pixels from bottom
-                        
-                        # Draw semi-transparent background for filename
-                        cv2.rectangle(frame, 
-                                    (x - 10, y - text_size[1] - 10),
-                                    (x + text_size[0] + 10, y + 10),
-                                    (0, 0, 0), -1)
-                        cv2.addWeighted(overlay, 0.3, frame, 0.7, 0, frame)
-                        
-                        # Draw filename
-                        cv2.putText(frame, filename_text, (x, y), font, font_scale, (255, 255, 255), thickness)
-                        
-                        cv2.imshow('Video', frame)
-                        frame_count += 1
-                        last_frame_time = current_time
-                
-            # Process keyboard input
+                if has_audio:
+                    # Use audio time to calculate frame
+                    audio_elapsed_ms = pygame.mixer.music.get_pos()
+                    if audio_elapsed_ms == -1:
+                        # Playback has stopped - don't auto-restart, just pause
+                        self.paused = True
+                        continue
+                    target_frame = int((audio_elapsed_ms / 1000.0) * fps)
+                    target_frame = min(target_frame, total_frames - 1)
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, target_frame)
+
+                ret, frame = cap.read()
+                if not ret:
+                    print("Reached end of video.")
+                    self.paused = True
+                    if has_audio:
+                        pygame.mixer.music.stop()
+                    continue
+
+                # Ensure frame is valid before processing
+                if frame is None or frame.size == 0:
+                    continue
+
+                font = cv2.FONT_HERSHEY_SIMPLEX
+                font_scale = 0.4
+                thickness = 1
+                spacing = 15
+
+                commands = [
+                    "SPACE: Play/Pause",
+                    "R: Replay",
+                    "B: Recut begin",
+                    "E: Recut end",
+                    "G: Gesture",
+                    "V: Vocal",
+                    "L: Language",
+                    "C: Add comment",
+                    "Q: Next + Mark watched",
+                    "ESC: Exit",
+                    "↑/↓: Volume"
+                ]
+
+                overlay = frame.copy()
+                h, w = frame.shape[:2]
+                cv2.rectangle(overlay, (0, 0), (150, len(commands) * spacing + 10), (0, 0, 0), -1)
+                cv2.addWeighted(overlay, 0.3, frame, 0.7, 0, frame)
+
+                for i, cmd in enumerate(commands):
+                    y = (i + 1) * spacing
+                    cv2.putText(frame, cmd, (5, y), font, font_scale, (255, 255, 255), thickness)
+
+                states = [
+                    f"B:{self.current_row.get('RECUT_BEGIN', 0)}",
+                    f"E:{self.current_row.get('RECUT_END', 0)}",
+                    f"G:{self.current_row.get('MOD_GESTURE', 0)}",
+                    f"V:{self.current_row.get('MOD_VOCAL', 0)}",
+                    f"L:{self.current_row.get('LANGUAGE', 0)}",
+                    f"W:{self.current_row.get('WATCHED', 0)}"
+                ]
+
+                cv2.rectangle(frame, (w-100, 0), (w, len(states) * spacing + 10), (0, 0, 0), -1)
+
+                for i, state in enumerate(states):
+                    y = (i + 1) * spacing
+                    cv2.putText(frame, state, (w-95, y), font, font_scale, (255, 255, 255), thickness)
+
+                filename_text = os.path.basename(video_file)
+                text_size = cv2.getTextSize(filename_text, font, font_scale, thickness)[0]
+                x = (w - text_size[0]) // 2
+                y = h - 20
+                cv2.rectangle(frame, (x - 10, y - text_size[1] - 10),
+                            (x + text_size[0] + 10, y + 10), (0, 0, 0), -1)
+                cv2.addWeighted(overlay, 0.3, frame, 0.7, 0, frame)
+                cv2.putText(frame, filename_text, (x, y), font, font_scale, (255, 255, 255), thickness)
+
+                cv2.imshow('Video', frame)
+                frame_count += 1
+            else:
+                # When paused, still need to show the current frame and check for keys
+                # But only if we have a valid frame
+                if frame is not None and frame.size > 0:
+                    cv2.imshow('Video', frame)
+
             key = cv2.waitKey(1)
-            
+
             if key == 27:  # ESC
-                # Save final state to filled CSV
                 self.save_progress()
                 print(f"\nFinal state saved to {self.filled_csv_path}")
-                
-                # Cleanup
                 cap.release()
                 cv2.destroyAllWindows()
                 self.stop_audio()
                 return False
-                
-            elif key == ord(' '):  # SPACE
+
+            elif key == ord(' '):
                 self.paused = not self.paused
-                if self.paused:
-                    if has_audio:
+                if has_audio:
+                    if self.paused:
                         pygame.mixer.music.pause()
-                else:
-                    if has_audio:
+                    else:
                         pygame.mixer.music.unpause()
-                
-            elif key == ord('r'):  # Replay
+
+            elif key == ord('r'):
                 cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                frame_count = 0
+                self.paused = False
                 if has_audio:
                     pygame.mixer.music.play()
-                last_frame_time = time.time()
-                
-            elif key == ord('b'):  # Recut begin
-                value = self.current_row.get('RECUT_BEGIN', 0)
-                self.current_row['RECUT_BEGIN'] = 0 if value == 1 else 1
+
+            elif key == ord('b'):
+                self.current_row['RECUT_BEGIN'] ^= 1
                 print("Recut begin:", bool(self.current_row['RECUT_BEGIN']))
-                
-            elif key == ord('e'):  # Recut end
-                value = self.current_row.get('RECUT_END', 0)
-                self.current_row['RECUT_END'] = 0 if value == 1 else 1
+
+            elif key == ord('e'):
+                self.current_row['RECUT_END'] ^= 1
                 print("Recut end:", bool(self.current_row['RECUT_END']))
-                
-            elif key == ord('g'):  # Gesture
-                value = self.current_row.get('MOD_GESTURE', 0)
-                self.current_row['MOD_GESTURE'] = 0 if value == 1 else 1
+
+            elif key == ord('g'):
+                self.current_row['MOD_GESTURE'] ^= 1
                 print("Gesture:", bool(self.current_row['MOD_GESTURE']))
-                
-            elif key == ord('v'):  # Vocal
-                value = self.current_row.get('MOD_VOCAL', 0)
-                self.current_row['MOD_VOCAL'] = 0 if value == 1 else 1
+
+            elif key == ord('v'):
+                self.current_row['MOD_VOCAL'] ^= 1
                 print("Vocal:", bool(self.current_row['MOD_VOCAL']))
-                
-            elif key == ord('l'):  # Language
-                value = self.current_row.get('LANGUAGE', 0)
-                self.current_row['LANGUAGE'] = 0 if value == 1 else 1
+
+            elif key == ord('l'):
+                self.current_row['LANGUAGE'] ^= 1
                 print("Language:", bool(self.current_row['LANGUAGE']))
-                
-            elif key == ord('c'):  # Comments
-                # Pause video when entering comment
+
+            elif key == ord('c'):
                 was_paused = self.paused
                 self.paused = True
                 if has_audio:
                     pygame.mixer.music.pause()
-                
-                # Show current comment if it exists
+
                 current_comment = self.current_row.get('COMMENT', '')
                 if current_comment:
                     print(f"\nCurrent comment: {current_comment}")
-                
-                # Get new comment
-                comment = input("\nEnter comment (press Enter to keep current, or type new comment): ").strip()
-                
-                # Update only if new comment provided
+                comment = input("\nEnter comment (press Enter to keep current): ").strip()
                 if comment:
                     self.current_row['COMMENT'] = comment
                     print("Comment updated:", comment)
@@ -357,48 +339,39 @@ class VideoAnnotator:
                     print("No comment added")
                 else:
                     print("Keeping existing comment:", current_comment)
-                
-                # Restore previous pause state
+
                 self.paused = was_paused
                 if not self.paused and has_audio:
                     pygame.mixer.music.unpause()
-                
-            elif key == 82:  # Up arrow - increase volume
-                current_volume = pygame.mixer.music.get_volume()
-                pygame.mixer.music.set_volume(min(1.0, current_volume + 0.1))
+
+            elif key == 82:
+                vol = pygame.mixer.music.get_volume()
+                pygame.mixer.music.set_volume(min(1.0, vol + 0.1))
                 print(f"Volume: {pygame.mixer.music.get_volume():.1f}")
-                
-            elif key == 84:  # Down arrow - decrease volume
-                current_volume = pygame.mixer.music.get_volume()
-                pygame.mixer.music.set_volume(max(0.0, current_volume - 0.1))
+
+            elif key == 84:
+                vol = pygame.mixer.music.get_volume()
+                pygame.mixer.music.set_volume(max(0.0, vol - 0.1))
                 print(f"Volume: {pygame.mixer.music.get_volume():.1f}")
-                
-            elif key == ord('q'):  # Next video
+
+            elif key == ord('q'):
                 print(f"\nMarking {self.current_row['FILE']} as watched and saving...")
-                
-                # Update current row with watched status
                 self.current_row['WATCHED'] = 1
-                
-                # Explicitly update filled_df with all current values
                 mask = self.filled_df['FILE'] == self.current_row['FILE']
                 if not mask.any():
-                    # Add new row if not exists
                     self.filled_df = pd.concat([self.filled_df, pd.DataFrame([self.current_row])], ignore_index=True)
                 else:
-                    # Update existing row
                     for key, value in self.current_row.items():
                         self.filled_df.loc[mask, key] = value
-                
-                # Save progress
+
                 self.save_progress()
-                
-                # Cleanup and move to next
                 cap.release()
                 cv2.destroyAllWindows()
                 self.stop_audio()
                 return True
 
         return True
+
 
     def process_videos(self, review_mode=False):
         if review_mode:
@@ -432,7 +405,11 @@ class VideoAnnotator:
         print("ESC: Save and exit program")
         print("↑/↓: Adjust volume")
         
-        for video_file in videos:
+        for i, video_file in enumerate(videos, 1):
+            print(f"\n{'='*50}")
+            print(f"Progress: {i}/{len(videos)} - Processing: {video_file}")
+            print(f"{'='*50}")
+            
             self.reset_current_row()
             self.current_row['FILE'] = video_file
             
