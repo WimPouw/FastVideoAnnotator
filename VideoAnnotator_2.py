@@ -9,7 +9,33 @@ from pydub import AudioSegment
 import time
 
 
-class VideoAnnotator:
+def _get_screen_size():
+    """Return (width, height) of the primary display, best-effort cross-platform."""
+    try:
+        # Windows - get true resolution
+        import ctypes
+        user32 = ctypes.windll.user32
+        try:
+            user32.SetProcessDPIAware()
+        except Exception:
+            pass
+        return user32.GetSystemMetrics(0), user32.GetSystemMetrics(1)
+    except Exception:
+        try:
+            # Fallback to tkinter if available
+            import tkinter as tk
+            root = tk.Tk()
+            root.withdraw()
+            w = root.winfo_screenwidth()
+            h = root.winfo_screenheight()
+            root.destroy()
+            return w, h
+        except Exception:
+            # Last resort: reasonable default
+            return 1366, 768
+
+
+class VideoAnnotator_2:
     def __init__(self, video_dir, csv_path):
         self.video_dir = video_dir
         self.csv_path = csv_path
@@ -33,11 +59,19 @@ class VideoAnnotator:
         if os.path.exists(csv_path):
             self.df = pd.read_csv(csv_path)
         else:
+            # Minimal template columns; legacy flags removed
             self.df = pd.DataFrame(columns=[
-                'FILE', 'RECUT_BEGIN', 'RECUT_END', 
-                'MOD_GESTURE', 'MOD_VOCAL', 'LANGUAGE', 
-                'WATCHED', 'NOTES'
+                'FILE', 'WATCHED', 'NOTES'
             ])
+
+        # Normalize template dataframe: ensure required columns exist and have sensible types
+        if 'FILE' not in self.df.columns:
+            self.df['FILE'] = ''
+        if 'WATCHED' not in self.df.columns:
+            self.df['WATCHED'] = 0
+        else:
+            # Coerce WATCHED to numeric, fill missing with 0, use integer dtype
+            self.df['WATCHED'] = pd.to_numeric(self.df['WATCHED'], errors='coerce').fillna(0).astype(int)
         
         # Handle filled CSV
         if os.path.exists(self.filled_csv_path):
@@ -50,6 +84,13 @@ class VideoAnnotator:
             self.filled_df['WATCHED'] = 0
             self.filled_df.to_csv(self.filled_csv_path, index=False)
             print(f"Created new filled CSV at: {self.filled_csv_path}")
+        # Normalize filled dataframe: ensure FILE and WATCHED exist and WATCHED is integer
+        if 'FILE' not in self.filled_df.columns:
+            self.filled_df['FILE'] = ''
+        if 'WATCHED' not in self.filled_df.columns:
+            self.filled_df['WATCHED'] = 0
+        else:
+            self.filled_df['WATCHED'] = pd.to_numeric(self.filled_df['WATCHED'], errors='coerce').fillna(0).astype(int)
         # Ensure new annotation columns exist in both template and filled DF
         new_cols = ['CUT', 'SOUND', 'HISS', 'MOVEMENT', 'NOISE', 'WEIRD']
         for col in new_cols:
@@ -62,6 +103,9 @@ class VideoAnnotator:
         self.current_row = {}
         self.paused = False
         self.temp_dir = tempfile.mkdtemp()
+        # Display settings: target window size (fraction of screen height)
+        self._display_target = None
+        self.display_scale = 0.75  # use 75% of screen height by default (user can change)
         
     def extract_audio(self, video_path):
         """Extract audio from video file and save as WAV"""
@@ -90,11 +134,6 @@ class VideoAnnotator:
     def reset_current_row(self):
         self.current_row = {
             'FILE': '',
-            'RECUT_BEGIN': 0,
-            'RECUT_END': 0,
-            'MOD_GESTURE': 0,
-            'MOD_VOCAL': 0,
-            'LANGUAGE': 0,
             'WATCHED': 0,  # Start with WATCHED = 0 since we haven't watched it yet
             'CUT': 0,
             'SOUND': 0,
@@ -168,8 +207,7 @@ class VideoAnnotator:
             print("Loaded existing annotation for review")
 
                 # Ensure toggle-able fields are integers
-            for key in ['RECUT_BEGIN', 'RECUT_END', 'MOD_GESTURE', 'MOD_VOCAL', 'LANGUAGE', 'WATCHED',
-                        'CUT', 'SOUND', 'HISS', 'MOVEMENT', 'NOISE', 'WEIRD']:
+            for key in ['WATCHED', 'CUT', 'SOUND', 'HISS', 'MOVEMENT', 'NOISE', 'WEIRD']:
                 if key in self.current_row:
                     try:
                         self.current_row[key] = int(self.current_row[key])
@@ -193,9 +231,9 @@ class VideoAnnotator:
 
         frame_count = 0
 
-        # Ensure OpenCV window is created for this video
-        cv2.namedWindow('Video', cv2.WINDOW_AUTOSIZE)
-        
+        # Ensure OpenCV window is created for this video (allow resizing)
+        cv2.namedWindow('Video', cv2.WINDOW_NORMAL)
+
         # Read the first frame to initialize the frame variable
         ret, frame = cap.read()
         if not ret:
@@ -232,10 +270,35 @@ class VideoAnnotator:
                 if frame is None or frame.size == 0:
                     continue
 
+                # Resize frame to target display size (2/3 of screen height) preserving aspect ratio
+                if not hasattr(self, '_display_target') or self._display_target is None:
+                    screen_w, screen_h = _get_screen_size()
+                    # Use configurable display scale (fraction of screen height)
+                    target_h = int(screen_h * self.display_scale)
+                    h0, w0 = frame.shape[:2]
+                    # compute width from aspect ratio
+                    target_w = int((w0 / h0) * target_h)
+                    # don't exceed 2/3 of screen width
+                    max_w = int(screen_w * 2 / 3)
+                    if target_w > max_w:
+                        target_w = max_w
+                        target_h = int((h0 / w0) * target_w)
+                    self._display_target = (target_w, target_h)
+                    # Set the OpenCV window to the computed size so it appears at correct scale
+                    try:
+                        cv2.resizeWindow('Video', self._display_target[0], self._display_target[1])
+                    except Exception:
+                        pass
+
+                disp_w, disp_h = self._display_target
+                display_frame = cv2.resize(frame, (disp_w, disp_h), interpolation=cv2.INTER_AREA)
+
+                # Draw overlay and text on the resized frame so it fits the screen correctly
                 font = cv2.FONT_HERSHEY_SIMPLEX
-                font_scale = 0.4
+                # scale font relative to height
+                font_scale = max(0.35, disp_h / 480 * 0.4)
                 thickness = 1
-                spacing = 15
+                spacing = max(12, int(disp_h / 40))
 
                 commands = [
                     "SPACE: Play/Pause",
@@ -251,14 +314,14 @@ class VideoAnnotator:
                     "↑/↓: Volume"
                 ]
 
-                overlay = frame.copy()
-                h, w = frame.shape[:2]
+                overlay = display_frame.copy()
+                h, w = display_frame.shape[:2]
                 cv2.rectangle(overlay, (0, 0), (150, len(commands) * spacing + 10), (0, 0, 0), -1)
-                cv2.addWeighted(overlay, 0.3, frame, 0.7, 0, frame)
+                cv2.addWeighted(overlay, 0.3, display_frame, 0.7, 0, display_frame)
 
                 for i, cmd in enumerate(commands):
                     y = (i + 1) * spacing
-                    cv2.putText(frame, cmd, (5, y), font, font_scale, (255, 255, 255), thickness)
+                    cv2.putText(display_frame, cmd, (5, y), font, font_scale, (255, 255, 255), thickness)
 
                 states = [
                     f"C:{self.current_row.get('CUT', 0)}",
@@ -270,28 +333,34 @@ class VideoAnnotator:
                     f"Watched:{self.current_row.get('WATCHED', 0)}"
                 ]
 
-                cv2.rectangle(frame, (w-100, 0), (w, len(states) * spacing + 10), (0, 0, 0), -1)
+                cv2.rectangle(display_frame, (w-100, 0), (w, len(states) * spacing + 10), (0, 0, 0), -1)
 
                 for i, state in enumerate(states):
                     y = (i + 1) * spacing
-                    cv2.putText(frame, state, (w-95, y), font, font_scale, (255, 255, 255), thickness)
+                    cv2.putText(display_frame, state, (w-95, y), font, font_scale, (255, 255, 255), thickness)
 
                 filename_text = os.path.basename(video_file)
                 text_size = cv2.getTextSize(filename_text, font, font_scale, thickness)[0]
                 x = (w - text_size[0]) // 2
                 y = h - 20
-                cv2.rectangle(frame, (x - 10, y - text_size[1] - 10),
+                cv2.rectangle(display_frame, (x - 10, y - text_size[1] - 10),
                             (x + text_size[0] + 10, y + 10), (0, 0, 0), -1)
-                cv2.addWeighted(overlay, 0.3, frame, 0.7, 0, frame)
-                cv2.putText(frame, filename_text, (x, y), font, font_scale, (255, 255, 255), thickness)
+                cv2.putText(display_frame, filename_text, (x, y), font, font_scale, (255, 255, 255), thickness)
 
-                cv2.imshow('Video', frame)
+                cv2.imshow('Video', display_frame)
                 frame_count += 1
             else:
                 # When paused, still need to show the current frame and check for keys
-                # But only if we have a valid frame
+                # Show the resized display frame (if target set) so window size stays consistent
                 if frame is not None and frame.size > 0:
-                    cv2.imshow('Video', frame)
+                    if hasattr(self, '_display_target') and self._display_target:
+                        try:
+                            disp = cv2.resize(frame, self._display_target, interpolation=cv2.INTER_AREA)
+                            cv2.imshow('Video', disp)
+                        except Exception:
+                            cv2.imshow('Video', frame)
+                    else:
+                        cv2.imshow('Video', frame)
 
             key = cv2.waitKey(1)
 
@@ -317,25 +386,7 @@ class VideoAnnotator:
                 if has_audio:
                     pygame.mixer.music.play()
 
-            elif key == ord('b'):
-                self.current_row['RECUT_BEGIN'] ^= 1
-                print("Recut begin:", bool(self.current_row['RECUT_BEGIN']))
-
-            elif key == ord('e'):
-                self.current_row['RECUT_END'] ^= 1
-                print("Recut end:", bool(self.current_row['RECUT_END']))
-
-            elif key == ord('g'):
-                self.current_row['MOD_GESTURE'] ^= 1
-                print("Gesture:", bool(self.current_row['MOD_GESTURE']))
-
-            elif key == ord('v'):
-                self.current_row['MOD_VOCAL'] ^= 1
-                print("Vocal:", bool(self.current_row['MOD_VOCAL']))
-
-            elif key == ord('l'):
-                self.current_row['LANGUAGE'] ^= 1
-                print("Language:", bool(self.current_row['LANGUAGE']))
+            # Legacy flags (recut/gesture/vocal/language) removed
 
             elif key == ord('c'):
                 # Toggle Cut flag
@@ -445,6 +496,9 @@ class VideoAnnotator:
 
     def get_unannotated_videos(self):
         """Get list of unwatched videos in CSV order"""
+        # Ensure filled_df includes entries for all files in the directory
+        self.ensure_filled_entries()
+        
         # Get list of available video files
         video_files = set(f for f in os.listdir(self.video_dir) if f.endswith(('.avi', '.mp4')))
         
@@ -453,6 +507,51 @@ class VideoAnnotator:
         
         # Filter to only include existing videos, maintain CSV order
         return [video for video in unwatched if video in video_files]
+
+    def ensure_filled_entries(self):
+        """Ensure `self.filled_df` has a row for every video file in the video directory.
+
+        Missing rows are appended with default values (WATCHED=0, numeric flags=0, text columns empty).
+        The filled CSV is updated on disk if new rows are added.
+        """
+        try:
+            video_files = sorted(f for f in os.listdir(self.video_dir) if f.endswith(('.avi', '.mp4')))
+        except Exception:
+            return
+
+        existing_files = set(self.filled_df['FILE'].astype(str).tolist()) if 'FILE' in self.filled_df.columns else set()
+        added = False
+
+        # Determine default value per column
+        cols = list(self.filled_df.columns)
+        for vf in video_files:
+            if vf not in existing_files:
+                # build a default row
+                new_row = {}
+                for c in cols:
+                    if c == 'FILE':
+                        new_row[c] = vf
+                    elif c == 'NOTES':
+                        new_row[c] = ''
+                    elif c == 'WATCHED':
+                        new_row[c] = 0
+                    else:
+                        # numeric flags default to 0
+                        new_row[c] = 0
+
+                self.filled_df = pd.concat([self.filled_df, pd.DataFrame([new_row])], ignore_index=True)
+                added = True
+
+        if added:
+            # Ensure WATCHED is integer
+            if 'WATCHED' in self.filled_df.columns:
+                self.filled_df['WATCHED'] = pd.to_numeric(self.filled_df['WATCHED'], errors='coerce').fillna(0).astype(int)
+            # Save updated filled CSV so UI/next runs see the entries
+            try:
+                self.filled_df.to_csv(self.filled_csv_path, index=False)
+                print(f"Added missing video entries to {self.filled_csv_path}")
+            except Exception as e:
+                print(f"Warning: Could not save filled CSV after adding entries: {e}")
 
 
 if __name__ == "__main__":
@@ -487,7 +586,7 @@ if __name__ == "__main__":
     
     print("\nStarting annotation session...")
     
-    annotator = VideoAnnotator(video_dir, csv_path)
+    annotator = VideoAnnotator_2(video_dir, csv_path)
     status = annotator.get_video_status()
     
     print(f"\nFound {status['total_videos']} videos in directory")
@@ -513,3 +612,7 @@ if __name__ == "__main__":
         else:
             print("\nExiting...")
             sys.exit(0)
+
+    # Backwards compatibility: expose the class under the original name
+    # so other code importing `VideoAnnotator` from this module continues to work.
+    VideoAnnotator = VideoAnnotator_2
